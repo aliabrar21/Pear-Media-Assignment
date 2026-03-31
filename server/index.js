@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const multer = require('multer');
+const sharp = require('sharp');
 const { OpenAI, toFile } = require('openai');
 
 dotenv.config();
@@ -12,9 +13,9 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Initialize OpenAI
+// Initialize OpenAI with dummy key if not found, to prevent crash on startup
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY || 'sk-dummy-key-update-in-env',
 });
 
 // Configure Multer for handling file uploads (stored in memory)
@@ -25,9 +26,15 @@ app.get('/', (req, res) => {
   res.send('AI Image & Text Generator API is running!');
 });
 
+// Helper to extract OpenAI specific error messages
+const getOpenAIError = (error) => {
+  if (error.status === 401) return 'Invalid OpenAI API Key. Please check the server/.env file.';
+  if (error.error && error.error.message) return error.error.message;
+  return error.message || 'An unknown error occurred.';
+};
+
 /**
  * POST /api/enhance-text
- * Input: { prompt: "a cat" }
  */
 app.post('/api/enhance-text', async (req, res) => {
   try {
@@ -49,13 +56,12 @@ app.post('/api/enhance-text', async (req, res) => {
     res.json({ enhancedPrompt: completion.choices[0].message.content.trim() });
   } catch (error) {
     console.error('Enhance Text Error:', error);
-    res.status(500).json({ error: 'Failed to enhance text' });
+    res.status(500).json({ error: getOpenAIError(error) });
   }
 });
 
 /**
  * POST /api/generate-image
- * Input: { prompt: "enhanced prompt here" }
  */
 app.post('/api/generate-image', async (req, res) => {
   try {
@@ -72,19 +78,17 @@ app.post('/api/generate-image', async (req, res) => {
     res.json({ imageUrl: response.data[0].url });
   } catch (error) {
     console.error('Generate Image Error:', error);
-    res.status(500).json({ error: 'Failed to generate image' });
+    res.status(500).json({ error: getOpenAIError(error) });
   }
 });
 
 /**
  * POST /api/analyze-image
- * Input: multipart form-data with 'image' file
  */
 app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Image file is required' });
 
-    // For OpenAI Vision, we can pass base64
     const base64Image = req.file.buffer.toString('base64');
     const imageUrl = `data:${req.file.mimetype};base64,${base64Image}`;
 
@@ -94,7 +98,7 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
         {
           role: 'user',
           content: [
-            { type: 'text', text: 'Analyze this image. Provide a detailed caption describing what you see, and list the main objects detected in the image as a JSON array. Return exactly this JSON structure: {"caption": "...", "objects": ["...", "..."]}. Do not wrap in markdown tags like ```json. Also keep the caption very concise.' },
+            { type: 'text', text: 'Analyze this image. Provide a detailed caption describing what you see, and list the main objects detected in the image as a JSON array. Return exactly this JSON structure: {"caption": "...", "objects": ["...", "..."]}. Do not wrap in markdown tags like ```json. Keep the caption concise.' },
             {
               type: 'image_url',
               image_url: { url: imageUrl },
@@ -119,20 +123,26 @@ app.post('/api/analyze-image', upload.single('image'), async (req, res) => {
     res.json(parsedResult);
   } catch (error) {
     console.error('Analyze Image Error:', error);
-    res.status(500).json({ error: 'Failed to analyze image' });
+    res.status(500).json({ error: getOpenAIError(error) });
   }
 });
 
 /**
  * POST /api/generate-variations
- * Input: multipart form-data with 'image' file
+ * Uses 'sharp' to ensure the image meets OpenAI's Square PNG requirements!
  */
 app.post('/api/generate-variations', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Image file is required' });
 
-    // Convert multer buffer to OpenAI File object
-    const file = await toFile(req.file.buffer, req.file.originalname, { type: req.file.mimetype });
+    // Use Sharp to convert the uploaded arbitrary image into a 1024x1024 PNG (Center-Cover cropped)
+    const formattedImageBuffer = await sharp(req.file.buffer)
+      .resize(1024, 1024, { fit: 'cover' })
+      .png()
+      .toBuffer();
+
+    // Convert sharp buffer to OpenAI format
+    const file = await toFile(formattedImageBuffer, 'image.png', { type: 'image/png' });
 
     const response = await openai.images.createVariation({
       image: file,
@@ -143,12 +153,7 @@ app.post('/api/generate-variations', upload.single('image'), async (req, res) =>
     res.json({ imageUrl: response.data[0].url });
   } catch (error) {
     console.error('Generate Variations Error:', error);
-    
-    // Check if the error is due to image format or size (must be square PNG <= 4MB)
-    if(error.response && error.response.data && error.response.data.error) {
-      return res.status(400).json({ error: error.response.data.error.message });
-    }
-    res.status(500).json({ error: 'Failed to generate variations. Ensure the image is a square PNG under 4MB.' });
+    res.status(500).json({ error: getOpenAIError(error) });
   }
 });
 
